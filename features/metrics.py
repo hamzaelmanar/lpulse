@@ -277,13 +277,14 @@ def exit_type(
 
     Logic:
         For each position where status == 1 (fully exited):
-          1. Find the last Swap event at or before the Burn block via merge_asof.
-          2. Compute tick_at_burn from sqrtPriceX96:
-                tick = floor(log2(sqrtPriceX96² / 2¹⁹²) / log2(1.0001))
-             Equivalently:
-                tick = floor(2 * log(sqrtPriceX96 / 2⁹⁶) / log(1.0001))
-          3. If tick_lower <= tick_at_burn <= tick_upper → 'voluntary_exit'
+          1. Find the last Swap event at or before exit_timestamp via merge_asof
+             on block_timestamp. The Swap row carries a decoded ``tick`` column
+             (current pool tick after the swap) — no sqrtPriceX96 computation needed.
+          2. If tick_lower <= tick_at_exit <= tick_upper → 'voluntary_exit'
+             (price was in-range when LP burned; they chose to leave)
              Else → 'range_exit'
+             (price was outside the LP's range; position had become dead capital)
+          3. No prior swap found → 'range_exit' (conservative fallback, logged)
         Censored positions (status == 0) → 'censored'
 
     The mercenary hypothesis predicts: campaign LPs cluster in voluntary_exit
@@ -295,18 +296,72 @@ def exit_type(
     lp_summary : DataFrame
         Output of verify_lp_exit(). Required columns:
         position_id, pool_address, chain_name, tick_lower, tick_upper,
-        exit_timestamp, status.
+        exit_timestamp (int, Unix seconds), status.
     swap_df : DataFrame
         Raw decoded Swap events. Required columns:
-        block_number, block_timestamp, chain_name, pool_address, sqrt_price_x96.
+        timestamp (hex or decimal string, Unix seconds), chain_name,
+        pool_address, tick (decimal string, current pool tick after swap).
 
     Returns
     -------
     lp_summary with an added ``exit_type`` column:
         'voluntary_exit' | 'range_exit' | 'censored'
     """
-    # TODO: implement
-    raise NotImplementedError("exit_type() — Phase 3")
+    result = lp_summary.copy()
+    result["exit_type"] = "censored"
+
+    exited_mask = result["status"] == 1
+    if not exited_mask.any():
+        return result
+
+    # ── Prepare swaps ──────────────────────────────────────────────────────
+    swaps = swap_df[["timestamp", "chain_name", "pool_address", "tick"]].copy()
+    swaps = swaps.rename(columns={"timestamp": "swap_ts"})
+    swaps["swap_ts"] = swaps["swap_ts"].apply(_hex_or_dec_to_int)
+    swaps["tick_int"] = swaps["tick"].apply(lambda x: int(x))
+    swaps = swaps.sort_values("swap_ts").reset_index(drop=True)
+
+    # ── Prepare exited positions ───────────────────────────────────────────
+    exited = result.loc[exited_mask, [
+        "position_id", "pool_address", "chain_name",
+        "tick_lower", "tick_upper", "exit_timestamp",
+    ]].copy()
+    exited = exited.sort_values("exit_timestamp").reset_index(drop=True)
+
+    # ── merge_asof: last swap at or before exit_timestamp, per pool ────────
+    # by=['pool_address', 'chain_name'] requires both DFs to have matching vals
+    merged = pd.merge_asof(
+        exited.rename(columns={"exit_timestamp": "swap_ts"}),
+        swaps[["pool_address", "chain_name", "swap_ts", "tick_int"]],
+        on="swap_ts",
+        by=["pool_address", "chain_name"],
+        direction="backward",
+    )
+
+    no_swap = merged["tick_int"].isna().sum()
+    if no_swap:
+        print(
+            f"  Warning: {no_swap} exited position(s) had no prior Swap event — "
+            "classified as range_exit (conservative)."
+        )
+
+    # ── Classify ───────────────────────────────────────────────────────────
+    def _classify(row) -> str:
+        if pd.isna(row["tick_int"]):
+            return "range_exit"
+        tick = int(row["tick_int"])
+        if int(row["tick_lower"]) <= tick <= int(row["tick_upper"]):
+            return "voluntary_exit"
+        return "range_exit"
+
+    merged["exit_type_val"] = merged.apply(_classify, axis=1)
+    exit_map = merged.set_index("position_id")["exit_type_val"].to_dict()
+
+    result.loc[exited_mask, "exit_type"] = (
+        result.loc[exited_mask, "position_id"].map(exit_map)
+    )
+
+    return result
 
 
 # ── event_sequence ────────────────────────────────────────────────────────────

@@ -231,16 +231,54 @@ class TestVerifyLpExit:
         )
 
 
-# ── Phases 3–5 (NotImplementedError expected until implemented) ───────────────
+# ── exit_type tests ───────────────────────────────────────────────────────────
+
+@requires_pg
+class TestExitType:
+    @pytest.fixture(scope="class")
+    def lp_with_exit_type(self, lp_summary, raw_events):
+        from features.metrics import exit_type
+        return exit_type(lp_summary, raw_events["swap"])
+
+    def test_column_present(self, lp_with_exit_type):
+        assert "exit_type" in lp_with_exit_type.columns
+
+    def test_valid_values(self, lp_with_exit_type):
+        bad = set(lp_with_exit_type["exit_type"].unique()) - VALID_EXIT_TYPES
+        assert not bad, f"Unexpected exit_type value(s): {bad}"
+
+    def test_censored_positions_are_censored(self, lp_with_exit_type):
+        censored = lp_with_exit_type[lp_with_exit_type["status"] == 0]
+        wrong = censored[censored["exit_type"] != "censored"]
+        assert wrong.empty, f"{len(wrong)} censored position(s) with non-censored exit_type"
+
+    def test_exited_positions_not_censored(self, lp_with_exit_type):
+        exited = lp_with_exit_type[lp_with_exit_type["status"] == 1]
+        wrong = exited[exited["exit_type"] == "censored"]
+        assert wrong.empty, f"{len(wrong)} exited position(s) labelled 'censored'"
+
+    def test_both_exit_types_present(self, lp_with_exit_type):
+        exited = lp_with_exit_type[lp_with_exit_type["status"] == 1]
+        types = set(exited["exit_type"].unique())
+        assert types, "No exited positions found"
+        # At least one type must be present; both is better
+        assert types.issubset({"voluntary_exit", "range_exit"}), \
+            f"Unexpected types in exited set: {types}"
+
+    def test_distribution_logged(self, lp_with_exit_type):
+        """Non-assertion: print distribution for human review."""
+        dist = lp_with_exit_type["exit_type"].value_counts()
+        print(f"\n  exit_type distribution:\n{dist.to_string()}")
+
+    def test_no_nulls(self, lp_with_exit_type):
+        nulls = lp_with_exit_type["exit_type"].isna().sum()
+        assert nulls == 0, f"{nulls} null exit_type value(s)"
+
+
+# ── Phases 4–5 (NotImplementedError expected until implemented) ───────────────
 
 @requires_pg
 class TestPhases35:
-    @pytest.mark.xfail(reason="exit_type() not yet implemented (Phase 3)", strict=True)
-    def test_exit_type_runs(self, lp_summary, raw_events):
-        from features.metrics import exit_type
-        result = exit_type(lp_summary, raw_events["swap"])
-        assert "exit_type" in result.columns
-
     @pytest.mark.xfail(reason="event_sequence() not yet implemented (Phase 4)", strict=True)
     def test_event_sequence_runs(self, lp_summary, raw_events):
         from features.metrics import event_sequence
