@@ -8,6 +8,10 @@ python-dotenv
 sqlalchemy
 psycopg2-binary
 
+# Ingestion
+hypersync
+pyyaml
+
 # Survival analysis (statistical layer)
 lifelines
 

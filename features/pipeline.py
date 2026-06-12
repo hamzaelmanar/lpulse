@@ -3,20 +3,25 @@ features/pipeline.py
 ─────────────────────
 Orchestrates the full feature engineering run for one pool.
 
-Reads from PostgreSQL (raw schema — already populated by financial-data-platform
-ingestion), calls features/metrics.py functions in dependency order, and writes
-three Parquet files to data/ for Hugo's Day-1 training jobs.
+Reads from either:
+  - PostgreSQL (default, --source postgres) — populated by FDP ingestion
+  - Local Parquet  (--source parquet)       — populated by ingestion/ingest.py
+
+Calls features/metrics.py functions in dependency order and writes three
+Parquet files to data/ for Hugo's Day-1 training jobs.
 
 Output files:
     data/lp_features.parquet         one row per position_id (at-entry features + labels)
     data/lp_survival_labels.parquet  position_id, duration_seconds, status, exit_type
     data/lp_event_sequences.parquet  long table keyed by position_id + seq_num
 
-Usage:
+Usage (Postgres source — existing FDP data):
     python -m features.pipeline \
-        --pool 0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c \
-        --chain celo \
-        --merkl-url "https://app.merkl.xyz/opportunities/celo/CLAMM/0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c"
+        --chain celo --pool 0xF557... --merkl-url "..."
+
+Usage (Parquet source — after running ingestion/ingest.py):
+    python -m features.pipeline \
+        --chain celo --pool 0xF557... --merkl-url "..." --source parquet
 
 Will be refactored into a PySpark job (Dataproc) for multi-pool fan-out.
 The pandas→Spark translation is 1-to-1: each function in metrics.py is
@@ -56,24 +61,43 @@ def _load_table(engine, table: str, chain: str, pool: str) -> pd.DataFrame:
             return pd.read_sql(q, conn, params={"chain": chain, "pool": pool.lower()})
     except Exception as exc:
         if "UndefinedTable" in type(exc).__name__ or "does not exist" in str(exc) or "n'existe pas" in str(exc):
-            print(f"  Warning: raw.{table} not found — returning empty DataFrame.")
+            print(f"  Warning: raw.{table} not found -- returning empty DataFrame.")
             return pd.DataFrame()
         raise
 
 
-def run(chain: str, pool: str, merkl_url: str) -> None:
-    engine = _get_engine()
+def _load_table_from_parquet(data_dir: Path, chain: str, pool: str, table: str) -> pd.DataFrame:
+    """Read a decoded event Parquet written by ingestion/decode_events.py.
+
+    Returns an empty DataFrame (not an error) when the file doesn't exist —
+    same contract as _load_table() for missing tables (e.g. lp_collect_events).
+    """
+    path = data_dir / "decoded" / chain / pool.lower() / f"{table}.parquet"
+    if path.exists():
+        return pd.read_parquet(path)
+    print(f"  Warning: {path} not found -- returning empty DataFrame.")
+    return pd.DataFrame()
+
+
+def run(chain: str, pool: str, merkl_url: str, source: str = "postgres") -> None:
     pool = pool.lower()
 
     print(f"Fetching campaign windows from Merkl API...")
     campaigns_df = fetch_campaign_windows(merkl_url)
     print(f"  {len(campaigns_df)} campaign(s) found.")
 
-    print(f"Loading raw events for {pool} on {chain}...")
-    mint_df     = _load_table(engine, "lp_mint_events",    chain, pool)
-    burn_df     = _load_table(engine, "lp_burn_events",    chain, pool)
-    swap_df     = _load_table(engine, "lp_swap_events",    chain, pool)
-    collect_df  = _load_table(engine, "lp_collect_events", chain, pool)
+    print(f"Loading raw events for {pool} on {chain} (source={source})...")
+    if source == "parquet":
+        mint_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_mint_events")
+        burn_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_burn_events")
+        swap_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_swap_events")
+        collect_df = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_collect_events")
+    else:
+        engine = _get_engine()
+        mint_df     = _load_table(engine, "lp_mint_events",    chain, pool)
+        burn_df     = _load_table(engine, "lp_burn_events",    chain, pool)
+        swap_df     = _load_table(engine, "lp_swap_events",    chain, pool)
+        collect_df  = _load_table(engine, "lp_collect_events", chain, pool)
     print(
         f"  Mints: {len(mint_df)}  Burns: {len(burn_df)}  "
         f"Swaps: {len(swap_df)}  Collects: {len(collect_df)}"
@@ -132,8 +156,10 @@ def main() -> None:
     parser.add_argument("--chain",     required=True, help="Chain name (e.g. celo)")
     parser.add_argument("--merkl-url", required=True,
                         help="Merkl opportunity URL for campaign window lookup")
+    parser.add_argument("--source", choices=["postgres", "parquet"], default="postgres",
+                        help="Event data source: postgres (default, FDP) or parquet (ingestion/ingest.py output)")
     args = parser.parse_args()
-    run(chain=args.chain, pool=args.pool, merkl_url=args.merkl_url)
+    run(chain=args.chain, pool=args.pool, merkl_url=args.merkl_url, source=args.source)
 
 
 if __name__ == "__main__":

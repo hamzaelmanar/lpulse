@@ -1,0 +1,34 @@
+# LPulse pool registry
+# One entry per pool. Used by `python -m ingestion.ingest --all`.
+#
+# Fields:
+#   chain         : HyperSync chain slug  (e.g. celo, hyperevm, arbitrum)
+#   pool_address  : V3 pool contract address (checksum preferred)
+#   merkl_url     : Merkl opportunity URL — passed directly to the feature pipeline
+#   description   : Human label for logging / docs
+#
+# Pool eligibility criteria (V3-compatible CLAMM, >=1 ended Merkl campaign):
+#   - Identical Mint/Burn/Swap/Collect ABI as Uniswap V3
+#   - HyperSwap on HyperEVM is a V3 fork (confirmed compatible)
+#   - V4 pools (Monad UNISWAP_V4) are NOT compatible — different ABI
+
+pools:
+
+  # ── CELO ──────────────────────────────────────────────────────────────────
+
+  - chain: celo
+    pool_address: "0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c"
+    merkl_url: "https://app.merkl.xyz/opportunities/celo/CLAMM/0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c"
+    description: "CELO/USD-T/WETH (primary validation pool — already in FDP Postgres)"
+
+  - chain: celo
+    pool_address: "0x1a810e0B6c2dd5629AFa2f0c898b9512C6F78846"
+    merkl_url: "https://app.merkl.xyz/opportunities/celo/CLAMM/0x1a810e0B6c2dd5629AFa2f0c898b9512C6F78846"
+    description: "CELO pool #2"
+
+  # ── HyperEVM ──────────────────────────────────────────────────────────────
+
+  - chain: hyperevm
+    pool_address: "0x6c9A33E3b592C0d65B3Ba59355d5Be0d38259285"
+    merkl_url: "https://app.merkl.xyz/opportunities/hyperevm/PROJECT_X/0x6c9A33E3b592C0d65B3Ba59355d5Be0d38259285"
+    description: "HyperSwap WHYPE/USDC (V3 fork — 1707 campaign participants)"

@@ -403,3 +403,195 @@ class TestPipelineRun:
         print(f"  sequences:    {len(seqs):,} rows, {seqs.shape[1]} cols")
         print(f"  cohorts:      {feat['lp_cohort'].value_counts().to_dict()}")
         print(f"  exit_type:    {feat['exit_type'].value_counts().to_dict()}")
+
+
+# ── ingestion/decode_events unit tests (no network, no Postgres) ──────────────
+
+class TestDecodeEvents:
+    """
+    Unit tests for ingestion/decode_events.py decoder functions.
+    All fixtures are synthetic — no HyperSync or Postgres required.
+    """
+
+    def _make_logs_row(self, event_name: str) -> dict:
+        """Return a minimal synthetic raw log row for the given event type."""
+        from ingestion.decode_events import TOPIC0_EVENT_MAP
+        topic0 = next(k for k, v in TOPIC0_EVENT_MAP.items() if v == event_name)
+        zeros64 = "0" * 64
+        # Synthetic addresses encoded as 32-byte padded topics
+        owner_topic  = "0x" + "0" * 24 + "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        sender_topic = "0x" + "0" * 24 + "1234567812345678123456781234567812345678"
+        # tick_lower = -100, tick_upper = 100 (sign-extended as int256 in topic)
+        tick_lower_hex = "0x" + hex(-100 % (2**256))[2:].zfill(64)
+        tick_upper_hex = "0x" + hex(100)[2:].zfill(64)
+
+        base = {
+            "block_number": "12345",
+            "transaction_hash": "0xabc",
+            "transaction_index": "0",
+            "log_index": "0",
+            "timestamp": "0x680fa8d8",
+            "chain_name": "celo",
+            "pool_address": "0xf55791",
+            "topic0": topic0,
+            "topic1": owner_topic,
+            "topic2": tick_lower_hex,
+            "topic3": tick_upper_hex,
+            "data": "0x" + zeros64 * 4,  # 4 zero words — valid for Mint/Burn
+        }
+        return base
+
+    def test_mint_decoder_returns_required_fields(self):
+        from ingestion.decode_events import _decode_mint
+        row = pd.Series(self._make_logs_row("Mint"))
+        result = _decode_mint(row)
+        assert set(result.keys()) == {"sender", "owner", "tick_lower", "tick_upper",
+                                      "amount", "amount0", "amount1"}
+
+    def test_burn_decoder_returns_required_fields(self):
+        from ingestion.decode_events import _decode_burn
+        row = pd.Series(self._make_logs_row("Burn"))
+        row["data"] = "0x" + "0" * 192  # 3 words for Burn
+        result = _decode_burn(row)
+        assert set(result.keys()) == {"owner", "tick_lower", "tick_upper",
+                                      "amount", "amount0", "amount1"}
+
+    def test_swap_decoder_returns_required_fields(self):
+        from ingestion.decode_events import _decode_swap
+        row = pd.Series(self._make_logs_row("Swap"))
+        row["data"] = "0x" + "0" * 320  # 5 words for Swap
+        result = _decode_swap(row)
+        assert set(result.keys()) == {"sender", "recipient", "amount0", "amount1",
+                                      "sqrt_price_x96", "liquidity", "tick"}
+
+    def test_tick_sign_extension(self):
+        """_to_int24 must handle negative ticks correctly (two's complement)."""
+        from ingestion.decode_events import _to_int24
+        # -887272 is the minimum V3 tick, stored as sign-extended int256 in topic
+        raw = hex(-887272 % (2**256))[2:].zfill(64)
+        assert _to_int24(raw) == -887272
+
+    def test_topic0_map_has_five_events(self):
+        from ingestion.decode_events import TOPIC0_EVENT_MAP
+        expected = {"Mint", "Burn", "Swap", "Initialize", "Collect"}
+        assert set(TOPIC0_EVENT_MAP.values()) == expected
+
+    def test_decode_writes_parquet(self, tmp_path):
+        """decode() on synthetic raw Parquet writes decoded files correctly."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from ingestion.decode_events import TOPIC0_EVENT_MAP, decode
+
+        # Build minimal raw logs parquet
+        zeros64 = "0" * 64
+        owner_topic  = "0x" + "0" * 24 + "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        tick_low_hex = "0x" + hex(-100 % (2**256))[2:].zfill(64)
+        tick_hi_hex  = "0x" + hex(100)[2:].zfill(64)
+        topic0_mint  = next(k for k, v in TOPIC0_EVENT_MAP.items() if v == "Mint")
+
+        logs_rows = [
+            {
+                "block_number": "100",
+                "transaction_hash": "0xabc",
+                "transaction_index": "0",
+                "log_index": "0",
+                "chain_name": "celo",
+                "pool_address": "0xtest",
+                "topic0": topic0_mint,
+                "topic1": owner_topic,
+                "topic2": tick_low_hex,
+                "topic3": tick_hi_hex,
+                "data": "0x" + zeros64 * 4,
+                "address": "0xtest",
+            }
+        ]
+        blocks_rows = [
+            {"number": "100", "timestamp": "0x680fa8d8", "chain_name": "celo"}
+        ]
+
+        chain, pool = "celo", "0xtest"
+        raw_dir = tmp_path / "raw" / chain / pool
+        raw_dir.mkdir(parents=True)
+        pd.DataFrame(logs_rows).to_parquet(raw_dir / "logs.parquet", index=False)
+        pd.DataFrame(blocks_rows).to_parquet(raw_dir / "blocks.parquet", index=False)
+
+        counts = decode(chain=chain, pool_address=pool, data_dir=tmp_path)
+
+        assert counts.get("Mint", 0) == 1
+        decoded_path = tmp_path / "decoded" / chain / pool / "lp_mint_events.parquet"
+        assert decoded_path.exists()
+        df = pd.read_parquet(decoded_path)
+        assert "owner" in df.columns
+        assert "tick_lower" in df.columns
+
+
+# ── pipeline --source parquet integration test ────────────────────────────────
+
+class TestPipelineParquetSource:
+    """
+    Runs pipeline.run() with source='parquet' using decoded Parquet files
+    from Postgres (re-exported) OR skips if the decoded directory doesn't exist.
+
+    This test validates the Parquet source path without requiring a live
+    HyperSync fetch. It uses the existing CELO pool data.
+    """
+
+    @pytest.fixture(scope="class")
+    def parquet_decoded_dir(self, tmp_path_factory):
+        """
+        Export decoded event tables from Postgres to a temp decoded/ directory,
+        mimicking what ingestion/decode_events.py would write.
+        Skips if Postgres is not available.
+        """
+        if not _pg_available():
+            pytest.skip("Postgres not available — skipping Parquet source test")
+
+        import os
+        from sqlalchemy import create_engine, text
+
+        url = (
+            f"postgresql+psycopg2://"
+            f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
+            f"@{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5432')}"
+            f"/{os.getenv('POSTGRES_DB')}"
+        )
+        eng = create_engine(url, future=True)
+
+        tmp = tmp_path_factory.mktemp("parquet_source")
+        pool_lower = CELO_POOL.lower()
+        out_dir = tmp / "decoded" / CELO_CHAIN / pool_lower
+        out_dir.mkdir(parents=True)
+
+        tables = ["lp_mint_events", "lp_burn_events", "lp_swap_events"]
+        for table in tables:
+            q = text(
+                f"SELECT * FROM raw.{table} "
+                "WHERE chain_name = :chain AND pool_address = :pool"
+            )
+            with eng.connect() as conn:
+                df = pd.read_sql(q, conn, params={"chain": CELO_CHAIN, "pool": pool_lower})
+            df.to_parquet(out_dir / f"{table}.parquet", index=False)
+
+        return tmp
+
+    def test_pipeline_runs_from_parquet(self, parquet_decoded_dir):
+        from features.pipeline import run
+        import importlib
+        import features.pipeline as pl
+
+        # Temporarily redirect DATA_DIR to tmp so we don't overwrite real data
+        original_data_dir = pl.DATA_DIR
+        pl.DATA_DIR = parquet_decoded_dir
+        try:
+            run(
+                chain=CELO_CHAIN,
+                pool=CELO_POOL,
+                merkl_url=CELO_MERKL,
+                source="parquet",
+            )
+            feat = pd.read_parquet(parquet_decoded_dir / "lp_features.parquet")
+            assert len(feat) > 0, "Expected non-empty lp_features from parquet source"
+            assert "position_id" in feat.columns
+            assert "exit_type" in feat.columns
+        finally:
+            pl.DATA_DIR = original_data_dir
