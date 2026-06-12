@@ -10,3 +10,6 @@ psycopg2-binary
 
 # Survival analysis (statistical layer)
 lifelines
+
+# Testing
+pytest

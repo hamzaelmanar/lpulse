@@ -51,13 +51,15 @@ def verify_lp_exit(
     mint_df : DataFrame
         Raw decoded Mint events. Required columns:
         block_number, transaction_hash, transaction_index, log_index,
-        block_timestamp, chain_name, pool_address,
+        timestamp, chain_name, pool_address,
         owner, tick_lower, tick_upper, amount (liquidity, decimal TEXT or numeric).
     burn_df : DataFrame
-        Raw decoded Burn events. Same columns except amount is liquidity removed.
+        Raw decoded Burn events. Same columns as mint_df.
     campaigns_df : DataFrame, optional
-        Merkl campaign windows. Required columns:
-        pool_address, chain_name, campaign_start (Unix s), campaign_end (Unix s).
+        Merkl campaign windows from fetch_campaign_windows(). Required columns:
+        start_timestamp (Unix s), end_timestamp (Unix s).
+        lp_cohort boundaries: global_start = min(start_timestamp),
+        global_end = max(end_timestamp), mirroring fct_lp_positions.sql logic.
         If None, lp_cohort is set to 'unknown' for all rows.
 
     Returns
@@ -79,8 +81,189 @@ def verify_lp_exit(
                             | 'unknown' (if no campaigns_df provided)
         event_count         total Mint+Burn events for this position
     """
-    # TODO: implement
-    raise NotImplementedError("verify_lp_exit() — Phase 2")
+    _SORT_COLS = [
+        "chain_name", "pool_address", "owner", "tick_lower", "tick_upper",
+        "block_number", "transaction_index", "log_index",
+    ]
+    _GROUP_KEY = ["chain_name", "pool_address", "owner", "tick_lower", "tick_upper"]
+    _CYCLE_KEY = _GROUP_KEY + ["cycle_id"]
+    _EVENT_COLS = [
+        "block_number", "transaction_hash", "transaction_index",
+        "log_index", "block_timestamp", "chain_name", "pool_address",
+        "owner", "tick_lower", "tick_upper",
+    ]
+
+    # ── 1. Normalise and combine Mint + Burn ──────────────────────────────────
+
+    def _prep(df: pd.DataFrame, event_type: str, sign: int) -> pd.DataFrame:
+        # Raw tables name the timestamp column "timestamp"; rename to block_timestamp.
+        out = df[
+            ["block_number", "transaction_hash", "transaction_index", "log_index",
+             "timestamp", "chain_name", "pool_address", "owner",
+             "tick_lower", "tick_upper", "amount"]
+        ].copy()
+        out = out.rename(columns={"timestamp": "block_timestamp"})
+        out["event_type"] = event_type
+        # Python int preserves uint128 precision (avoids int64 overflow)
+        out["liquidity_delta"] = out["amount"].apply(lambda x: sign * int(x))
+        return out[_EVENT_COLS + ["event_type", "liquidity_delta"]]
+
+    mints = _prep(mint_df, "Mint", +1)
+    burns = _prep(burn_df, "Burn", -1)
+    # Drop zero-amount burns (dust / fee collection artefacts)
+    burns = burns[burns["liquidity_delta"] != 0].copy()
+
+    events = pd.concat([mints, burns], ignore_index=True)
+
+    # Cast sort columns to int for correct numeric ordering
+    for col in ["block_number", "transaction_index", "log_index", "block_timestamp",
+                "tick_lower", "tick_upper"]:
+        events[col] = events[col].apply(_hex_or_dec_to_int)
+    events["owner"] = events["owner"].str.lower()
+    events["pool_address"] = events["pool_address"].str.lower()
+
+    events = events.sort_values(_SORT_COLS).reset_index(drop=True)
+
+    # ── 2. Cumulative liquidity per position_key ──────────────────────────────
+    # Python-int cumsum via transform preserves arbitrary precision.
+    events["cumulative_liq"] = (
+        events.groupby(_GROUP_KEY)["liquidity_delta"]
+        .transform(lambda s: s.cumsum())
+    )
+
+    # State BEFORE adding this event's liquidity
+    events["cumulative_liq_before"] = (
+        events.groupby(_GROUP_KEY)["cumulative_liq"]
+        .transform(lambda s: s.shift(1).fillna(0))
+    )
+
+    # ── 3. Cycle detection ────────────────────────────────────────────────────
+    # A new cycle starts when: a Mint arrives and cumulative_liq_before == 0.
+    # (First Mint on a tick range always has cumulative_liq_before == 0 because
+    #  fillna(0) fills the first row; re-opened ranges also satisfy this after
+    #  cumulative_liq hit 0 on a prior Burn.)
+    events["is_cycle_start"] = (
+        (events["event_type"] == "Mint") & (events["cumulative_liq_before"] == 0)
+    )
+
+    # Orphan Burns (Burn with no preceding Mint) are data anomalies — warn and drop.
+    orphans = events[(events["event_type"] == "Burn") & (events["cumulative_liq_before"] == 0)]
+    if not orphans.empty:
+        print(
+            f"  Warning: {len(orphans)} orphan Burn event(s) with cumulative_liq_before == 0 "
+            "(no preceding Mint on same tick range). These rows will be dropped."
+        )
+
+    events["cycle_id"] = (
+        events.groupby(_GROUP_KEY)["is_cycle_start"].transform("cumsum")
+    )
+
+    # Drop orphans (cycle_id == 0 means no opening Mint was ever seen)
+    events = events[events["cycle_id"] > 0].copy()
+
+    # ── 4. Per-cycle aggregation ──────────────────────────────────────────────
+
+    # Opening Mint tx hash (the event that started the cycle)
+    cycle_opens = (
+        events[events["is_cycle_start"]][_CYCLE_KEY + ["transaction_hash"]]
+        .rename(columns={"transaction_hash": "first_mint_tx_hash"})
+    )
+
+    # Final cumulative liquidity (last row in each cycle, already sorted)
+    final_liq = (
+        events.groupby(_CYCLE_KEY)["cumulative_liq"]
+        .last()
+        .reset_index()
+        .rename(columns={"cumulative_liq": "final_cumulative_liq"})
+    )
+
+    # First Mint timestamp
+    first_mint_ts = (
+        events[events["event_type"] == "Mint"]
+        .groupby(_CYCLE_KEY)["block_timestamp"]
+        .min()
+        .reset_index()
+        .rename(columns={"block_timestamp": "first_mint_timestamp"})
+    )
+
+    # Last event timestamp per cycle (used as exit_timestamp for fully exited positions)
+    last_event_ts = (
+        events.groupby(_CYCLE_KEY)["block_timestamp"]
+        .max()
+        .reset_index()
+        .rename(columns={"block_timestamp": "last_event_timestamp"})
+    )
+
+    event_counts = (
+        events.groupby(_CYCLE_KEY).size().reset_index(name="event_count")
+    )
+
+    cycle_df = (
+        cycle_opens
+        .merge(final_liq, on=_CYCLE_KEY)
+        .merge(first_mint_ts, on=_CYCLE_KEY)
+        .merge(last_event_ts, on=_CYCLE_KEY)
+        .merge(event_counts, on=_CYCLE_KEY)
+    )
+
+    # ── 5. Pool-level max timestamp (right-censoring time) ────────────────────
+    pool_max_ts = (
+        events.groupby(["chain_name", "pool_address"])["block_timestamp"]
+        .max()
+        .reset_index()
+        .rename(columns={"block_timestamp": "pool_max_timestamp"})
+    )
+    cycle_df = cycle_df.merge(pool_max_ts, on=["chain_name", "pool_address"])
+
+    # ── 6. Survival labels ────────────────────────────────────────────────────
+    cycle_df["status"] = (cycle_df["final_cumulative_liq"] == 0).astype(int)
+    cycle_df["exit_timestamp"] = np.where(
+        cycle_df["status"] == 1,
+        cycle_df["last_event_timestamp"],
+        cycle_df["pool_max_timestamp"],
+    )
+    cycle_df["duration_seconds"] = (
+        cycle_df["exit_timestamp"] - cycle_df["first_mint_timestamp"]
+    )
+
+    # ── 7. At-entry features ──────────────────────────────────────────────────
+    cycle_df["tick_range_width"] = cycle_df["tick_upper"] - cycle_df["tick_lower"]
+
+    # ── 8. Stable position_id (includes first_mint_tx_hash) ──────────────────
+    cycle_df["position_id"] = cycle_df.apply(
+        lambda r: _make_position_id(
+            r["chain_name"], r["pool_address"], r["owner"],
+            int(r["tick_lower"]), int(r["tick_upper"]), r["first_mint_tx_hash"],
+        ),
+        axis=1,
+    )
+
+    # ── 9. lp_cohort — mirrors fct_lp_positions.sql cross join campaign_window ─
+    if campaigns_df is not None and not campaigns_df.empty:
+        global_start = int(campaigns_df["start_timestamp"].min())
+        global_end   = int(campaigns_df["end_timestamp"].max())
+
+        def _cohort(ts: int) -> str:
+            if ts < global_start:
+                return "pre_campaign"
+            elif ts <= global_end:
+                return "during_campaign"
+            else:
+                return "post_campaign"
+
+        cycle_df["lp_cohort"] = cycle_df["first_mint_timestamp"].apply(_cohort)
+    else:
+        cycle_df["lp_cohort"] = "unknown"
+
+    # ── 10. Final output ──────────────────────────────────────────────────────
+    out_cols = [
+        "position_id", "owner", "pool_address", "chain_name",
+        "tick_lower", "tick_upper", "tick_range_width",
+        "first_mint_tx_hash", "first_mint_timestamp",
+        "exit_timestamp", "duration_seconds", "status", "lp_cohort",
+        "event_count",
+    ]
+    return cycle_df[out_cols].reset_index(drop=True)
 
 
 # ── exit_type ─────────────────────────────────────────────────────────────────
@@ -181,6 +364,12 @@ def event_sequence(
 
 
 # ── Internal helpers (shared by multiple functions) ───────────────────────────
+
+def _hex_or_dec_to_int(x) -> int:
+    """Convert a value that may be a 0x-prefixed hex string or a decimal string to int."""
+    s = str(x).strip()
+    return int(s, 16) if s.startswith(("0x", "0X")) else int(s)
+
 
 def _make_position_id(
     chain_name: str,

@@ -13,7 +13,10 @@ Output files:
     data/lp_event_sequences.parquet  long table keyed by position_id + seq_num
 
 Usage:
-    python -m features.pipeline --pool 0xF55791... --chain celo
+    python -m features.pipeline \
+        --pool 0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c \
+        --chain celo \
+        --merkl-url "https://app.merkl.xyz/opportunities/celo/CLAMM/0xF55791AfBB35aD42984f18D6Fe3e1fF73D81900c"
 
 Will be refactored into a PySpark job (Dataproc) for multi-pool fan-out.
 The pandas→Spark translation is 1-to-1: each function in metrics.py is
@@ -25,12 +28,13 @@ import os
 from pathlib import Path
 
 import pandas as pd
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+from features._env import setup
+from features.merkl import fetch_campaign_windows
 from features.metrics import event_sequence, exit_type, verify_lp_exit
 
-load_dotenv()
+setup()
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
@@ -47,28 +51,37 @@ def _get_engine():
 
 def _load_table(engine, table: str, chain: str, pool: str) -> pd.DataFrame:
     q = text(f"SELECT * FROM raw.{table} WHERE chain_name = :chain AND pool_address = :pool")
-    with engine.connect() as conn:
-        return pd.read_sql(q, conn, params={"chain": chain, "pool": pool.lower()})
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(q, conn, params={"chain": chain, "pool": pool.lower()})
+    except Exception as exc:
+        if "UndefinedTable" in type(exc).__name__ or "does not exist" in str(exc) or "n'existe pas" in str(exc):
+            print(f"  Warning: raw.{table} not found — returning empty DataFrame.")
+            return pd.DataFrame()
+        raise
 
 
-def run(chain: str, pool: str) -> None:
+def run(chain: str, pool: str, merkl_url: str) -> None:
     engine = _get_engine()
     pool = pool.lower()
 
+    print(f"Fetching campaign windows from Merkl API…")
+    campaigns_df = fetch_campaign_windows(merkl_url)
+    print(f"  {len(campaigns_df)} campaign(s) found.")
+
     print(f"Loading raw events for {pool} on {chain}…")
-    mint_df = _load_table(engine, "lp_mint_events", chain, pool)
-    burn_df = _load_table(engine, "lp_burn_events", chain, pool)
-    swap_df = _load_table(engine, "lp_swap_events", chain, pool)
-    collect_df = _load_table(engine, "lp_collect_events", chain, pool)
-
-    campaigns_q = text(
-        "SELECT * FROM raw.merkl_campaigns WHERE chain_name = :chain AND pool_address = :pool"
+    mint_df     = _load_table(engine, "lp_mint_events",    chain, pool)
+    burn_df     = _load_table(engine, "lp_burn_events",    chain, pool)
+    swap_df     = _load_table(engine, "lp_swap_events",    chain, pool)
+    collect_df  = _load_table(engine, "lp_collect_events", chain, pool)
+    print(
+        f"  Mints: {len(mint_df)}  Burns: {len(burn_df)}  "
+        f"Swaps: {len(swap_df)}  Collects: {len(collect_df)}"
     )
-    with engine.connect() as conn:
-        campaigns_df = pd.read_sql(campaigns_q, conn, params={"chain": chain, "pool": pool})
 
-    print("Building lp_summary…")
+    print("Building lp_summary (verify_lp_exit)…")
     lp_summary = verify_lp_exit(mint_df, burn_df, campaigns_df)
+    print(f"  {len(lp_summary)} positions reconstructed.")
 
     print("Classifying exit types…")
     lp_summary = exit_type(lp_summary, swap_df)
@@ -99,10 +112,12 @@ def run(chain: str, pool: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LPulse feature pipeline")
-    parser.add_argument("--pool", required=True, help="Pool contract address")
-    parser.add_argument("--chain", required=True, help="Chain name (e.g. celo)")
+    parser.add_argument("--pool",      required=True, help="Pool contract address")
+    parser.add_argument("--chain",     required=True, help="Chain name (e.g. celo)")
+    parser.add_argument("--merkl-url", required=True,
+                        help="Merkl opportunity URL for campaign window lookup")
     args = parser.parse_args()
-    run(chain=args.chain, pool=args.pool)
+    run(chain=args.chain, pool=args.pool, merkl_url=args.merkl_url)
 
 
 if __name__ == "__main__":
