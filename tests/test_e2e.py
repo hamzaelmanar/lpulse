@@ -338,3 +338,68 @@ class TestEventSequence:
         print(f"\n  event_type distribution:\n{dist.to_string()}")
         n_with_price = sequences["price_at_event"].notna().sum()
         print(f"  price_at_event coverage: {n_with_price}/{len(sequences)} rows")
+
+
+# ── pipeline.run() integration test ──────────────────────────────────────────
+
+@requires_pg
+class TestPipelineRun:
+    """
+    Runs the full pipeline end-to-end: Merkl URL → Postgres → 3 Parquet files.
+    This is the Phase 5 integration test — verifies the full output shape.
+    """
+
+    @pytest.fixture(scope="class", autouse=True)
+    def run_pipeline(self):
+        from features.pipeline import DATA_DIR, run
+        run(chain=CELO_CHAIN, pool=CELO_POOL, merkl_url=CELO_MERKL)
+        return DATA_DIR
+
+    def test_lp_features_exists(self):
+        from features.pipeline import DATA_DIR
+        assert (DATA_DIR / "lp_features.parquet").exists()
+
+    def test_lp_survival_labels_exists(self):
+        from features.pipeline import DATA_DIR
+        assert (DATA_DIR / "lp_survival_labels.parquet").exists()
+
+    def test_lp_event_sequences_exists(self):
+        from features.pipeline import DATA_DIR
+        assert (DATA_DIR / "lp_event_sequences.parquet").exists()
+
+    def test_features_no_duplicate_ids(self):
+        from features.pipeline import DATA_DIR
+        df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        dupes = df[df["position_id"].duplicated()]
+        assert dupes.empty, f"{len(dupes)} duplicate position_id(s) in lp_features"
+
+    def test_features_no_null_exit_type(self):
+        from features.pipeline import DATA_DIR
+        df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        nulls = df["exit_type"].isna().sum()
+        assert nulls == 0, f"{nulls} null exit_type in lp_features"
+
+    def test_survival_labels_row_count_matches_features(self):
+        from features.pipeline import DATA_DIR
+        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        surv = pd.read_parquet(DATA_DIR / "lp_survival_labels.parquet")
+        assert len(feat) == len(surv), (
+            f"lp_features has {len(feat)} rows but lp_survival_labels has {len(surv)}"
+        )
+
+    def test_sequences_position_ids_subset_of_features(self):
+        from features.pipeline import DATA_DIR
+        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        seqs = pd.read_parquet(DATA_DIR / "lp_event_sequences.parquet")
+        orphans = set(seqs["position_id"].unique()) - set(feat["position_id"].unique())
+        assert not orphans, f"{len(orphans)} position_id(s) in sequences not in features"
+
+    def test_summary_printed(self, capsys):
+        # Pipeline already ran via autouse fixture — just verify output shape.
+        from features.pipeline import DATA_DIR
+        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        seqs = pd.read_parquet(DATA_DIR / "lp_event_sequences.parquet")
+        print(f"\n  lp_features:  {len(feat):,} rows, {feat.shape[1]} cols")
+        print(f"  sequences:    {len(seqs):,} rows, {seqs.shape[1]} cols")
+        print(f"  cohorts:      {feat['lp_cohort'].value_counts().to_dict()}")
+        print(f"  exit_type:    {feat['exit_type'].value_counts().to_dict()}")

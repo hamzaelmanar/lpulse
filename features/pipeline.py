@@ -65,11 +65,11 @@ def run(chain: str, pool: str, merkl_url: str) -> None:
     engine = _get_engine()
     pool = pool.lower()
 
-    print(f"Fetching campaign windows from Merkl API…")
+    print(f"Fetching campaign windows from Merkl API...")
     campaigns_df = fetch_campaign_windows(merkl_url)
     print(f"  {len(campaigns_df)} campaign(s) found.")
 
-    print(f"Loading raw events for {pool} on {chain}…")
+    print(f"Loading raw events for {pool} on {chain}...")
     mint_df     = _load_table(engine, "lp_mint_events",    chain, pool)
     burn_df     = _load_table(engine, "lp_burn_events",    chain, pool)
     swap_df     = _load_table(engine, "lp_swap_events",    chain, pool)
@@ -79,14 +79,14 @@ def run(chain: str, pool: str, merkl_url: str) -> None:
         f"Swaps: {len(swap_df)}  Collects: {len(collect_df)}"
     )
 
-    print("Building lp_summary (verify_lp_exit)…")
+    print("Building lp_summary (verify_lp_exit)...")
     lp_summary = verify_lp_exit(mint_df, burn_df, campaigns_df)
     print(f"  {len(lp_summary)} positions reconstructed.")
 
-    print("Classifying exit types…")
+    print("Classifying exit types...")
     lp_summary = exit_type(lp_summary, swap_df)
 
-    print("Building event sequences…")
+    print("Building event sequences...")
     sequences = event_sequence(mint_df, burn_df, collect_df, swap_df, lp_summary)
 
     DATA_DIR.mkdir(exist_ok=True)
@@ -100,14 +100,30 @@ def run(chain: str, pool: str, merkl_url: str) -> None:
     ]
     lp_features = lp_summary[at_entry_cols]
     lp_features.to_parquet(DATA_DIR / "lp_features.parquet", index=False)
-    print(f"  → data/lp_features.parquet ({len(lp_features)} rows)")
 
     survival_cols = ["position_id", "duration_seconds", "status", "exit_type"]
     lp_summary[survival_cols].to_parquet(DATA_DIR / "lp_survival_labels.parquet", index=False)
-    print(f"  → data/lp_survival_labels.parquet")
 
     sequences.to_parquet(DATA_DIR / "lp_event_sequences.parquet", index=False)
-    print(f"  → data/lp_event_sequences.parquet ({len(sequences)} rows)")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    n_exited   = int((lp_summary["status"] == 1).sum())
+    n_censored = int((lp_summary["status"] == 0).sum())
+    exit_dist  = lp_summary["exit_type"].value_counts().to_dict()
+    cohort_dist = lp_summary["lp_cohort"].value_counts().to_dict()
+
+    print("\n" + "-" * 60)
+    print(f"  pool             {pool}")
+    print(f"  chain            {chain}")
+    print(f"  positions        {len(lp_summary):,}  ({n_exited:,} exited, {n_censored:,} censored)")
+    print(f"  exit_type        {exit_dist}")
+    print(f"  lp_cohort        {cohort_dist}")
+    print(f"  sequence rows    {len(sequences):,}")
+    print("-" * 60)
+    print(f"  -> data/lp_features.parquet         ({len(lp_features):,} rows)")
+    print(f"  -> data/lp_survival_labels.parquet  ({len(lp_summary):,} rows)")
+    print(f"  -> data/lp_event_sequences.parquet  ({len(sequences):,} rows)")
+    print("-" * 60)
 
 
 def main() -> None:
