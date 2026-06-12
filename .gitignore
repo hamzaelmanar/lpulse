@@ -1,0 +1,19 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Data outputs (local only — will be replaced by BQ in production)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/

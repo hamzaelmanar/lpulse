@@ -1,0 +1,12 @@
+# Core
+pandas
+numpy
+pyarrow
+python-dotenv
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Survival analysis (statistical layer)
+lifelines
