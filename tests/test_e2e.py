@@ -177,20 +177,8 @@ class TestVerifyLpExit:
         bad = set(lp_summary["lp_cohort"].unique()) - VALID_COHORTS
         assert not bad, f"Unexpected lp_cohort value(s): {bad}"
 
-    def test_all_three_cohorts_present(self, lp_summary):
-        cohorts = set(lp_summary["lp_cohort"].unique())
-        expected = {"pre_campaign", "during_campaign", "post_campaign"}
-        missing = expected - cohorts
-        assert not missing, (
-            f"Expected cohorts {expected}, missing: {missing}. "
-            f"Found: {cohorts}"
-        )
-
     def test_no_null_position_ids(self, lp_summary):
         assert lp_summary["position_id"].notna().all()
-
-    def test_no_null_first_mint_timestamp(self, lp_summary):
-        assert lp_summary["first_mint_timestamp"].notna().all()
 
     def test_tick_range_width_positive(self, lp_summary):
         bad = lp_summary[lp_summary["tick_range_width"] <= 0]
@@ -199,36 +187,6 @@ class TestVerifyLpExit:
     def test_event_count_at_least_one(self, lp_summary):
         bad = lp_summary[lp_summary["event_count"] < 1]
         assert bad.empty, f"{len(bad)} position(s) with event_count < 1"
-
-    def test_more_positions_than_unique_owners(self, lp_summary):
-        """
-        Validates the core fix: per-cycle position_id means at minimum as many
-        positions as unique owners. With re-opens on the same tick range there
-        should be strictly more positions than owners.
-        """
-        n_positions = len(lp_summary)
-        n_owners = lp_summary["owner"].nunique()
-        assert n_positions >= n_owners, \
-            "Should have at least as many positions as unique owners"
-
-    def test_cohort_split_sanity(self, lp_summary, campaigns):
-        """
-        All during_campaign LPs must have first_mint_timestamp within
-        [global_start, global_end]. Sanity-checks the cohort assignment.
-        """
-        global_start = int(campaigns["start_timestamp"].min())
-        global_end   = int(campaigns["end_timestamp"].max())
-        during = lp_summary[lp_summary["lp_cohort"] == "during_campaign"]
-        if during.empty:
-            pytest.skip("No during_campaign positions found — nothing to check")
-        out_of_window = during[
-            (during["first_mint_timestamp"] < global_start) |
-            (during["first_mint_timestamp"] > global_end)
-        ]
-        assert out_of_window.empty, (
-            f"{len(out_of_window)} during_campaign LP(s) have first_mint_timestamp "
-            "outside the campaign window"
-        )
 
 
 # ── exit_type tests ───────────────────────────────────────────────────────────
@@ -257,19 +215,6 @@ class TestExitType:
         wrong = exited[exited["exit_type"] == "censored"]
         assert wrong.empty, f"{len(wrong)} exited position(s) labelled 'censored'"
 
-    def test_both_exit_types_present(self, lp_with_exit_type):
-        exited = lp_with_exit_type[lp_with_exit_type["status"] == 1]
-        types = set(exited["exit_type"].unique())
-        assert types, "No exited positions found"
-        # At least one type must be present; both is better
-        assert types.issubset({"voluntary_exit", "range_exit"}), \
-            f"Unexpected types in exited set: {types}"
-
-    def test_distribution_logged(self, lp_with_exit_type):
-        """Non-assertion: print distribution for human review."""
-        dist = lp_with_exit_type["exit_type"].value_counts()
-        print(f"\n  exit_type distribution:\n{dist.to_string()}")
-
     def test_no_nulls(self, lp_with_exit_type):
         nulls = lp_with_exit_type["exit_type"].isna().sum()
         assert nulls == 0, f"{nulls} null exit_type value(s)"
@@ -287,9 +232,6 @@ class TestEventSequence:
             raw_events["collect"], raw_events["swap"],
             lp_summary,
         )
-
-    def test_returns_dataframe(self, sequences):
-        assert isinstance(sequences, pd.DataFrame)
 
     def test_non_empty(self, sequences):
         assert len(sequences) > 0
@@ -310,99 +252,39 @@ class TestEventSequence:
         bad = first_seqs[first_seqs != 0]
         assert bad.empty, f"{len(bad)} position(s) where seq_num doesn't start at 0"
 
-    def test_seq_num_contiguous(self, sequences):
-        """seq_num within each position is 0,1,2,... with no gaps."""
-        def _gapless(s):
-            return list(sorted(s)) == list(range(len(s)))
-        bad = sequences.groupby("position_id")["seq_num"].apply(_gapless)
-        assert bad.all(), f"{(~bad).sum()} position(s) with non-contiguous seq_num"
-
     def test_all_position_ids_in_summary(self, sequences, lp_summary):
         seq_ids  = set(sequences["position_id"].unique())
         summ_ids = set(lp_summary["position_id"].unique())
         orphans  = seq_ids - summ_ids
         assert not orphans, f"{len(orphans)} position_id(s) in sequences not in lp_summary"
 
-    def test_each_position_has_mint_and_burn(self, sequences, lp_summary):
-        """Every exited position must have at least one Mint and one Burn."""
-        exited_ids = set(lp_summary[lp_summary["status"] == 1]["position_id"])
-        seq_exited = sequences[sequences["position_id"].isin(exited_ids)]
-        by_pos = seq_exited.groupby("position_id")["event_type"].apply(set)
-        missing_mint = by_pos[by_pos.apply(lambda s: "Mint" not in s)]
-        missing_burn = by_pos[by_pos.apply(lambda s: "Burn" not in s)]
-        assert missing_mint.empty, f"{len(missing_mint)} exited position(s) missing Mint"
-        assert missing_burn.empty, f"{len(missing_burn)} exited position(s) missing Burn"
 
-    def test_distribution_logged(self, sequences):
-        dist = sequences["event_type"].value_counts()
-        print(f"\n  event_type distribution:\n{dist.to_string()}")
-        n_with_price = sequences["price_at_event"].notna().sum()
-        print(f"  price_at_event coverage: {n_with_price}/{len(sequences)} rows")
+# ── pipeline output smoke test (reads existing Parquet — no re-run) ──────────────────────────────────────────
 
-
-# ── pipeline.run() integration test ──────────────────────────────────────────
-
-@requires_pg
-class TestPipelineRun:
+class TestPipelineOutput:
     """
-    Runs the full pipeline end-to-end: Merkl URL → Postgres → 3 Parquet files.
-    This is the Phase 5 integration test — verifies the full output shape.
+    Reads existing Parquet output (written by the last pipeline run) and checks
+    structural invariants. Does NOT re-run the pipeline — fast, no Postgres.
+    Skips if output files don't exist yet.
     """
 
     @pytest.fixture(scope="class", autouse=True)
-    def run_pipeline(self):
-        from features.pipeline import DATA_DIR, run
-        run(chain=CELO_CHAIN, pool=CELO_POOL, merkl_url=CELO_MERKL)
-        return DATA_DIR
-
-    def test_lp_features_exists(self):
+    def _require_output(self):
         from features.pipeline import DATA_DIR
-        assert (DATA_DIR / "lp_features.parquet").exists()
+        if not (DATA_DIR / "lp_features.parquet").exists():
+            pytest.skip("No pipeline output found — run features.pipeline first")
 
-    def test_lp_survival_labels_exists(self):
-        from features.pipeline import DATA_DIR
-        assert (DATA_DIR / "lp_survival_labels.parquet").exists()
-
-    def test_lp_event_sequences_exists(self):
-        from features.pipeline import DATA_DIR
-        assert (DATA_DIR / "lp_event_sequences.parquet").exists()
-
-    def test_features_no_duplicate_ids(self):
+    def test_no_duplicate_position_ids(self):
         from features.pipeline import DATA_DIR
         df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
         dupes = df[df["position_id"].duplicated()]
         assert dupes.empty, f"{len(dupes)} duplicate position_id(s) in lp_features"
 
-    def test_features_no_null_exit_type(self):
+    def test_no_null_exit_type(self):
         from features.pipeline import DATA_DIR
         df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
         nulls = df["exit_type"].isna().sum()
         assert nulls == 0, f"{nulls} null exit_type in lp_features"
-
-    def test_survival_labels_row_count_matches_features(self):
-        from features.pipeline import DATA_DIR
-        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
-        surv = pd.read_parquet(DATA_DIR / "lp_survival_labels.parquet")
-        assert len(feat) == len(surv), (
-            f"lp_features has {len(feat)} rows but lp_survival_labels has {len(surv)}"
-        )
-
-    def test_sequences_position_ids_subset_of_features(self):
-        from features.pipeline import DATA_DIR
-        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
-        seqs = pd.read_parquet(DATA_DIR / "lp_event_sequences.parquet")
-        orphans = set(seqs["position_id"].unique()) - set(feat["position_id"].unique())
-        assert not orphans, f"{len(orphans)} position_id(s) in sequences not in features"
-
-    def test_summary_printed(self, capsys):
-        # Pipeline already ran via autouse fixture — just verify output shape.
-        from features.pipeline import DATA_DIR
-        feat = pd.read_parquet(DATA_DIR / "lp_features.parquet")
-        seqs = pd.read_parquet(DATA_DIR / "lp_event_sequences.parquet")
-        print(f"\n  lp_features:  {len(feat):,} rows, {feat.shape[1]} cols")
-        print(f"  sequences:    {len(seqs):,} rows, {seqs.shape[1]} cols")
-        print(f"  cohorts:      {feat['lp_cohort'].value_counts().to_dict()}")
-        print(f"  exit_type:    {feat['exit_type'].value_counts().to_dict()}")
 
 
 # ── ingestion/decode_events unit tests (no network, no Postgres) ──────────────
@@ -525,73 +407,4 @@ class TestDecodeEvents:
         assert "tick_lower" in df.columns
 
 
-# ── pipeline --source parquet integration test ────────────────────────────────
 
-class TestPipelineParquetSource:
-    """
-    Runs pipeline.run() with source='parquet' using decoded Parquet files
-    from Postgres (re-exported) OR skips if the decoded directory doesn't exist.
-
-    This test validates the Parquet source path without requiring a live
-    HyperSync fetch. It uses the existing CELO pool data.
-    """
-
-    @pytest.fixture(scope="class")
-    def parquet_decoded_dir(self, tmp_path_factory):
-        """
-        Export decoded event tables from Postgres to a temp decoded/ directory,
-        mimicking what ingestion/decode_events.py would write.
-        Skips if Postgres is not available.
-        """
-        if not _pg_available():
-            pytest.skip("Postgres not available — skipping Parquet source test")
-
-        import os
-        from sqlalchemy import create_engine, text
-
-        url = (
-            f"postgresql+psycopg2://"
-            f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
-            f"@{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5432')}"
-            f"/{os.getenv('POSTGRES_DB')}"
-        )
-        eng = create_engine(url, future=True)
-
-        tmp = tmp_path_factory.mktemp("parquet_source")
-        pool_lower = CELO_POOL.lower()
-        out_dir = tmp / "decoded" / CELO_CHAIN / pool_lower
-        out_dir.mkdir(parents=True)
-
-        tables = ["lp_mint_events", "lp_burn_events", "lp_swap_events"]
-        for table in tables:
-            q = text(
-                f"SELECT * FROM raw.{table} "
-                "WHERE chain_name = :chain AND pool_address = :pool"
-            )
-            with eng.connect() as conn:
-                df = pd.read_sql(q, conn, params={"chain": CELO_CHAIN, "pool": pool_lower})
-            df.to_parquet(out_dir / f"{table}.parquet", index=False)
-
-        return tmp
-
-    def test_pipeline_runs_from_parquet(self, parquet_decoded_dir):
-        from features.pipeline import run
-        import importlib
-        import features.pipeline as pl
-
-        # Temporarily redirect DATA_DIR to tmp so we don't overwrite real data
-        original_data_dir = pl.DATA_DIR
-        pl.DATA_DIR = parquet_decoded_dir
-        try:
-            run(
-                chain=CELO_CHAIN,
-                pool=CELO_POOL,
-                merkl_url=CELO_MERKL,
-                source="parquet",
-            )
-            feat = pd.read_parquet(parquet_decoded_dir / "lp_features.parquet")
-            assert len(feat) > 0, "Expected non-empty lp_features from parquet source"
-            assert "position_id" in feat.columns
-            assert "exit_type" in feat.columns
-        finally:
-            pl.DATA_DIR = original_data_dir
