@@ -374,29 +374,37 @@ def event_sequence(
     lp_summary: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Build the event sequence table: one row per event per position_id.
+    Build the event sequence table: one row per LP action per position_id.
 
-    Used by the DRSA/LSTM model to learn event trajectories leading to exit.
-    The sequence [Mint → Swap×N → Collect → Burn] encodes the behavioural
-    signature of an LP's lifecycle. Fees stop accumulating when price leaves
-    range — this pattern is a leading indicator of exit.
+    Sequence contains only LP-action events (Mint, Burn, Collect). Swaps are
+    pool-level and would bloat the table by O(positions × swaps_per_lifetime).
+    Instead, each row carries ``price_at_event`` — the pool tick from the last
+    Swap before the event, attached via merge_asof. This gives the DRSA/LSTM
+    price context at each LP decision point without the bloat.
+
+    NOTE: if Hugo's DRSA design requires raw Swap rows as sequence events
+    (e.g. for a tick-trajectory model), add a swap_as_events=True flag here
+    and concat swap rows per position filtered by [first_mint_ts, exit_ts].
 
     Parameters
     ----------
-    mint_df, burn_df, collect_df : DataFrame
-        Decoded event tables. Required columns: block_number, block_timestamp,
-        transaction_hash, log_index, chain_name, pool_address,
-        owner, tick_lower, tick_upper, amount (or amount0/amount1 for collect).
-
-        Note: collect_df uses raw.lp_collect_events (decoded via HyperSync;
-        topic0 = 0x70935338…). Ensure this table is populated before calling.
+    mint_df, burn_df : DataFrame
+        Decoded Mint/Burn events. Required columns: block_number, transaction_hash,
+        transaction_index, log_index, timestamp, chain_name, pool_address,
+        owner, tick_lower, tick_upper, amount, amount0, amount1.
+    collect_df : DataFrame
+        Decoded Collect events (raw.lp_collect_events). May be empty if the
+        table hasn't been decoded yet — rows are simply absent from sequences.
+        Required columns when non-empty: block_number, transaction_hash,
+        transaction_index, log_index, timestamp, chain_name, pool_address,
+        owner, tick_lower, tick_upper, amount0, amount1.
     swap_df : DataFrame
-        Swap events. Required columns: block_number, block_timestamp,
-        chain_name, pool_address, sqrt_price_x96.
+        Decoded Swap events. Used only for price_at_event lookup. Required
+        columns: timestamp, chain_name, pool_address, tick.
     lp_summary : DataFrame
-        Output of verify_lp_exit(). Used to resolve position_id per event.
-        Required columns: position_id, owner, pool_address, chain_name,
-        tick_lower, tick_upper, first_mint_timestamp.
+        Output of verify_lp_exit(). Required columns: position_id, owner,
+        pool_address, chain_name, tick_lower, tick_upper,
+        first_mint_timestamp, exit_timestamp.
 
     Returns
     -------
@@ -405,17 +413,126 @@ def event_sequence(
         seq_num         0-indexed event order within the position lifecycle
         event_type      'Mint' | 'Burn' | 'Collect'
         block_number
-        block_timestamp
+        block_timestamp (int, Unix seconds)
         transaction_hash
         log_index
         liquidity_delta signed liquidity change (0 for Collect)
-        amount0_raw     token0 amount (numeric)
-        amount1_raw     token1 amount (numeric)
-        price_at_event  spot price derived from last Swap before this event
-                        via merge_asof on block_number (NaN if no prior Swap)
+        amount0_raw
+        amount1_raw
+        price_at_event  pool tick from last Swap before this event (NaN if none)
     """
-    # TODO: implement
-    raise NotImplementedError("event_sequence() — Phase 4")
+    _MATCH_KEYS = ["chain_name", "pool_address", "owner", "tick_lower", "tick_upper"]
+
+    # ── 1. Normalise LP-action events to a common schema ──────────────────
+
+    def _prep_mint_burn(df: pd.DataFrame, event_type: str, liq_sign: int) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        out = df[[
+            "block_number", "transaction_hash", "transaction_index", "log_index",
+            "timestamp", "chain_name", "pool_address",
+            "owner", "tick_lower", "tick_upper",
+            "amount", "amount0", "amount1",
+        ]].copy()
+        out = out.rename(columns={
+            "timestamp": "block_timestamp",
+            "amount0": "amount0_raw",
+            "amount1": "amount1_raw",
+        })
+        out["event_type"] = event_type
+        out["liquidity_delta"] = out["amount"].apply(lambda x: liq_sign * int(x))
+        return out.drop(columns=["amount"])
+
+    def _prep_collect(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        out = df[[
+            "block_number", "transaction_hash", "transaction_index", "log_index",
+            "timestamp", "chain_name", "pool_address",
+            "owner", "tick_lower", "tick_upper",
+            "amount0", "amount1",
+        ]].copy()
+        out = out.rename(columns={
+            "timestamp": "block_timestamp",
+            "amount0": "amount0_raw",
+            "amount1": "amount1_raw",
+        })
+        out["event_type"] = "Collect"
+        out["liquidity_delta"] = 0
+        return out
+
+    pieces = [
+        _prep_mint_burn(mint_df,  "Mint", +1),
+        _prep_mint_burn(burn_df,  "Burn", -1),
+        _prep_collect(collect_df),
+    ]
+    pieces = [p for p in pieces if not p.empty]
+    if not pieces:
+        return pd.DataFrame()
+
+    events = pd.concat(pieces, ignore_index=True)
+
+    # ── 2. Normalise types ────────────────────────────────────────────────
+    for col in ["block_number", "transaction_index", "log_index", "block_timestamp"]:
+        events[col] = events[col].apply(_hex_or_dec_to_int)
+    for col in ["tick_lower", "tick_upper"]:
+        events[col] = events[col].apply(lambda x: int(x))
+    events["owner"]        = events["owner"].str.lower()
+    events["pool_address"] = events["pool_address"].str.lower()
+
+    # ── 3. Assign position_id via non-equi join ───────────────────────────
+    # Join on identity keys, then keep only events inside the cycle window.
+    positions = lp_summary[[
+        "position_id", "chain_name", "pool_address", "owner",
+        "tick_lower", "tick_upper", "first_mint_timestamp", "exit_timestamp",
+    ]].copy()
+
+    merged = events.merge(positions, on=_MATCH_KEYS, how="left")
+    in_window = (
+        (merged["block_timestamp"] >= merged["first_mint_timestamp"]) &
+        (merged["block_timestamp"] <= merged["exit_timestamp"])
+    )
+    merged = merged[in_window].drop(columns=["first_mint_timestamp", "exit_timestamp"])
+
+    unmatched = events.shape[0] - in_window.sum()
+    if unmatched:
+        print(f"  Warning: {unmatched} event row(s) could not be assigned to a position cycle.")
+
+    # ── 4. Attach price_at_event (last swap tick before each event) ───────
+    swaps = swap_df[["timestamp", "chain_name", "pool_address", "tick"]].copy()
+    swaps = swaps.rename(columns={"timestamp": "swap_ts"})
+    swaps["swap_ts"]   = swaps["swap_ts"].apply(_hex_or_dec_to_int)
+    swaps["tick_int"]  = swaps["tick"].apply(lambda x: int(x))
+    swaps["pool_address"] = swaps["pool_address"].str.lower()
+    swaps["chain_name"]   = swaps["chain_name"].str.lower()
+    swaps = swaps.sort_values("swap_ts").reset_index(drop=True)
+
+    merged = merged.sort_values("block_timestamp").reset_index(drop=True)
+
+    merged = pd.merge_asof(
+        merged.rename(columns={"block_timestamp": "swap_ts"}),
+        swaps[["pool_address", "chain_name", "swap_ts", "tick_int"]],
+        on="swap_ts",
+        by=["pool_address", "chain_name"],
+        direction="backward",
+    ).rename(columns={"swap_ts": "block_timestamp", "tick_int": "price_at_event"})
+
+    # ── 5. seq_num within each position ──────────────────────────────────
+    merged = merged.sort_values(
+        ["position_id", "block_timestamp", "transaction_index", "log_index"]
+    ).reset_index(drop=True)
+
+    merged["seq_num"] = (
+        merged.groupby("position_id").cumcount()
+    )
+
+    # ── 6. Final column selection ─────────────────────────────────────────
+    out_cols = [
+        "position_id", "seq_num", "event_type",
+        "block_number", "block_timestamp", "transaction_hash", "log_index",
+        "liquidity_delta", "amount0_raw", "amount1_raw", "price_at_event",
+    ]
+    return merged[out_cols].reset_index(drop=True)
 
 
 # ── Internal helpers (shared by multiple functions) ───────────────────────────

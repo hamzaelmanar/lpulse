@@ -275,17 +275,66 @@ class TestExitType:
         assert nulls == 0, f"{nulls} null exit_type value(s)"
 
 
-# ── Phases 4–5 (NotImplementedError expected until implemented) ───────────────
+# ── event_sequence tests ──────────────────────────────────────────────────────
 
 @requires_pg
-class TestPhases35:
-    @pytest.mark.xfail(reason="event_sequence() not yet implemented (Phase 4)", strict=True)
-    def test_event_sequence_runs(self, lp_summary, raw_events):
+class TestEventSequence:
+    @pytest.fixture(scope="class")
+    def sequences(self, raw_events, lp_summary):
         from features.metrics import event_sequence
-        result = event_sequence(
+        return event_sequence(
             raw_events["mint"], raw_events["burn"],
             raw_events["collect"], raw_events["swap"],
             lp_summary,
         )
-        assert "position_id" in result.columns
-        assert "seq_num" in result.columns
+
+    def test_returns_dataframe(self, sequences):
+        assert isinstance(sequences, pd.DataFrame)
+
+    def test_non_empty(self, sequences):
+        assert len(sequences) > 0
+
+    def test_required_columns(self, sequences):
+        required = {"position_id", "seq_num", "event_type", "block_number",
+                    "block_timestamp", "transaction_hash", "log_index",
+                    "liquidity_delta", "amount0_raw", "amount1_raw", "price_at_event"}
+        missing = required - set(sequences.columns)
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_event_type_values(self, sequences):
+        bad = set(sequences["event_type"].unique()) - {"Mint", "Burn", "Collect"}
+        assert not bad, f"Unexpected event_type values: {bad}"
+
+    def test_seq_num_starts_at_zero(self, sequences):
+        first_seqs = sequences.groupby("position_id")["seq_num"].min()
+        bad = first_seqs[first_seqs != 0]
+        assert bad.empty, f"{len(bad)} position(s) where seq_num doesn't start at 0"
+
+    def test_seq_num_contiguous(self, sequences):
+        """seq_num within each position is 0,1,2,... with no gaps."""
+        def _gapless(s):
+            return list(sorted(s)) == list(range(len(s)))
+        bad = sequences.groupby("position_id")["seq_num"].apply(_gapless)
+        assert bad.all(), f"{(~bad).sum()} position(s) with non-contiguous seq_num"
+
+    def test_all_position_ids_in_summary(self, sequences, lp_summary):
+        seq_ids  = set(sequences["position_id"].unique())
+        summ_ids = set(lp_summary["position_id"].unique())
+        orphans  = seq_ids - summ_ids
+        assert not orphans, f"{len(orphans)} position_id(s) in sequences not in lp_summary"
+
+    def test_each_position_has_mint_and_burn(self, sequences, lp_summary):
+        """Every exited position must have at least one Mint and one Burn."""
+        exited_ids = set(lp_summary[lp_summary["status"] == 1]["position_id"])
+        seq_exited = sequences[sequences["position_id"].isin(exited_ids)]
+        by_pos = seq_exited.groupby("position_id")["event_type"].apply(set)
+        missing_mint = by_pos[by_pos.apply(lambda s: "Mint" not in s)]
+        missing_burn = by_pos[by_pos.apply(lambda s: "Burn" not in s)]
+        assert missing_mint.empty, f"{len(missing_mint)} exited position(s) missing Mint"
+        assert missing_burn.empty, f"{len(missing_burn)} exited position(s) missing Burn"
+
+    def test_distribution_logged(self, sequences):
+        dist = sequences["event_type"].value_counts()
+        print(f"\n  event_type distribution:\n{dist.to_string()}")
+        n_with_price = sequences["price_at_event"].notna().sum()
+        print(f"  price_at_event coverage: {n_with_price}/{len(sequences)} rows")
