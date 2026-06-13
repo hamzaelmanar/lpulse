@@ -270,19 +270,22 @@ class TestPipelineOutput:
 
     @pytest.fixture(scope="class", autouse=True)
     def _require_output(self):
-        from features.pipeline import DATA_DIR
-        if not (DATA_DIR / "lp_features.parquet").exists():
+        from features.pipeline import BASE_DATA_DIR
+        out = BASE_DATA_DIR / CELO_CHAIN / CELO_POOL.lower() / "lp_features.parquet"
+        if not out.exists():
             pytest.skip("No pipeline output found — run features.pipeline first")
 
+    def _out(self, filename):
+        from features.pipeline import BASE_DATA_DIR
+        return BASE_DATA_DIR / CELO_CHAIN / CELO_POOL.lower() / filename
+
     def test_no_duplicate_position_ids(self):
-        from features.pipeline import DATA_DIR
-        df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        df = pd.read_parquet(self._out("lp_features.parquet"))
         dupes = df[df["position_id"].duplicated()]
         assert dupes.empty, f"{len(dupes)} duplicate position_id(s) in lp_features"
 
     def test_no_null_exit_type(self):
-        from features.pipeline import DATA_DIR
-        df = pd.read_parquet(DATA_DIR / "lp_features.parquet")
+        df = pd.read_parquet(self._out("lp_features.parquet"))
         nulls = df["exit_type"].isna().sum()
         assert nulls == 0, f"{nulls} null exit_type in lp_features"
 

@@ -41,7 +41,7 @@ from features.metrics import event_sequence, exit_type, verify_lp_exit
 
 setup()
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+BASE_DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 def _get_engine():
@@ -79,19 +79,18 @@ def _load_table_from_parquet(data_dir: Path, chain: str, pool: str, table: str) 
     return pd.DataFrame()
 
 
-def run(chain: str, pool: str, merkl_url: str, source: str = "postgres") -> None:
+def run(chain: str, pool: str, merkl_url: str, source: str = "postgres") -> Path:
     pool = pool.lower()
-
-    print(f"Fetching campaign windows from Merkl API...")
-    campaigns_df = fetch_campaign_windows(merkl_url)
+    out_dir = BASE_DATA_DIR / chain / pool
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  {len(campaigns_df)} campaign(s) found.")
 
     print(f"Loading raw events for {pool} on {chain} (source={source})...")
     if source == "parquet":
-        mint_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_mint_events")
-        burn_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_burn_events")
-        swap_df    = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_swap_events")
-        collect_df = _load_table_from_parquet(DATA_DIR, chain, pool, "lp_collect_events")
+        mint_df    = _load_table_from_parquet(BASE_DATA_DIR, chain, pool, "lp_mint_events")
+        burn_df    = _load_table_from_parquet(BASE_DATA_DIR, chain, pool, "lp_burn_events")
+        swap_df    = _load_table_from_parquet(BASE_DATA_DIR, chain, pool, "lp_swap_events")
+        collect_df = _load_table_from_parquet(BASE_DATA_DIR, chain, pool, "lp_collect_events")
     else:
         engine = _get_engine()
         mint_df     = _load_table(engine, "lp_mint_events",    chain, pool)
@@ -123,12 +122,12 @@ def run(chain: str, pool: str, merkl_url: str, source: str = "postgres") -> None
         "event_count",
     ]
     lp_features = lp_summary[at_entry_cols]
-    lp_features.to_parquet(DATA_DIR / "lp_features.parquet", index=False)
+    lp_features.to_parquet(out_dir / "lp_features.parquet", index=False)
 
     survival_cols = ["position_id", "duration_seconds", "status", "exit_type"]
-    lp_summary[survival_cols].to_parquet(DATA_DIR / "lp_survival_labels.parquet", index=False)
+    lp_summary[survival_cols].to_parquet(out_dir / "lp_survival_labels.parquet", index=False)
 
-    sequences.to_parquet(DATA_DIR / "lp_event_sequences.parquet", index=False)
+    sequences.to_parquet(out_dir / "lp_event_sequences.parquet", index=False)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     n_exited   = int((lp_summary["status"] == 1).sum())
@@ -144,10 +143,11 @@ def run(chain: str, pool: str, merkl_url: str, source: str = "postgres") -> None
     print(f"  lp_cohort        {cohort_dist}")
     print(f"  sequence rows    {len(sequences):,}")
     print("-" * 60)
-    print(f"  -> data/lp_features.parquet         ({len(lp_features):,} rows)")
-    print(f"  -> data/lp_survival_labels.parquet  ({len(lp_summary):,} rows)")
-    print(f"  -> data/lp_event_sequences.parquet  ({len(sequences):,} rows)")
+    print(f"  -> {out_dir}/lp_features.parquet         ({len(lp_features):,} rows)")
+    print(f"  -> {out_dir}/lp_survival_labels.parquet  ({len(lp_summary):,} rows)")
+    print(f"  -> {out_dir}/lp_event_sequences.parquet  ({len(sequences):,} rows)")
     print("-" * 60)
+    return out_dir
 
 
 def main() -> None:

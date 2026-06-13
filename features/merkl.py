@@ -28,11 +28,26 @@ def _get_json(path: str) -> object:
     return json.loads(res.read().decode("utf-8"), object_pairs_hook=OrderedDict)
 
 
+# Merkl chain name → chain ID overrides for chains where the app URL slug
+# differs from the API's accepted chainName parameter.
+_CHAIN_ID_OVERRIDES: dict[str, int] = {
+    "hyperevm": 999,   # Merkl URL slug is "hyperevm" but API needs chainId=999
+}
+
+
 def _opportunity_id(chain_name: str, pool_type: str, explorer_address: str) -> str:
+    # Try by chainName first (works for most chains)
     data = _get_json(
         f"/v4/opportunities?chainName={chain_name}&type={pool_type}"
         f"&explorerAddress={explorer_address}"
     )
+    # Fall back to chainId if chainName returns nothing
+    if not data and chain_name in _CHAIN_ID_OVERRIDES:
+        chain_id = _CHAIN_ID_OVERRIDES[chain_name]
+        data = _get_json(
+            f"/v4/opportunities?chainId={chain_id}&type={pool_type}"
+            f"&explorerAddress={explorer_address}"
+        )
     if not data:
         raise ValueError(
             f"No Merkl opportunity found for chain={chain_name} "

@@ -26,9 +26,11 @@ pools:
     merkl_url: "https://app.merkl.xyz/opportunities/celo/CLAMM/0x1a810e0B6c2dd5629AFa2f0c898b9512C6F78846"
     description: "CELO pool #2"
 
-  # ── HyperEVM ──────────────────────────────────────────────────────────────
+  # ── HyperEVM (chain ID 999) ───────────────────────────────────────────────
+  # HyperSync slug: "hyperliquid" (HyperEVM is the EVM layer of Hyperliquid L1)
+  # Merkl URL slug: "hyperevm" -- API falls back to chainId=999 (see merkl.py)
 
-  - chain: hyperevm
+  - chain: hyperliquid
     pool_address: "0x6c9A33E3b592C0d65B3Ba59355d5Be0d38259285"
     merkl_url: "https://app.merkl.xyz/opportunities/hyperevm/PROJECT_X/0x6c9A33E3b592C0d65B3Ba59355d5Be0d38259285"
-    description: "HyperSwap WHYPE/USDC (V3 fork — 1707 campaign participants)"
+    description: "ProjectX WHYPE/USDC 0.05% (V3 fork -- 1707 campaign participants, LIVE)"
