@@ -492,11 +492,24 @@ def event_sequence(
         (merged["block_timestamp"] >= merged["first_mint_timestamp"]) &
         (merged["block_timestamp"] <= merged["exit_timestamp"])
     )
-    merged = merged[in_window].drop(columns=["first_mint_timestamp", "exit_timestamp"])
+    merged = merged[in_window].copy()
 
-    unmatched = events.shape[0] - in_window.sum()
-    if unmatched:
-        print(f"  Warning: {unmatched} event row(s) could not be assigned to a position cycle.")
+    # When the same owner re-opens the same tick range (common on tight stablecoin
+    # pools), an event can match multiple cycles. Resolve by keeping the cycle whose
+    # first_mint_timestamp is closest-but-not-after the event timestamp.
+    merged["_cycle_proximity"] = merged["block_timestamp"] - merged["first_mint_timestamp"]
+    event_id_cols = ["transaction_hash", "log_index"]
+    merged = (
+        merged
+        .sort_values("_cycle_proximity")
+        .drop_duplicates(subset=event_id_cols, keep="first")
+    )
+    merged = merged.drop(columns=["first_mint_timestamp", "exit_timestamp", "_cycle_proximity"])
+
+    n_in  = events.shape[0]
+    n_out = len(merged)
+    if n_out < n_in:
+        print(f"  Warning: {n_in - n_out} event row(s) fell outside all position cycle windows.")
 
     # ── 4. Attach price_at_event (last swap tick before each event) ───────
     swaps = swap_df[["timestamp", "chain_name", "pool_address", "tick"]].copy()
