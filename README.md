@@ -52,9 +52,6 @@ Requires: Python 3.11+, Java 11+, `pip install -r requirements.txt`.
 
 ## Spark pipeline — design & decisions
 
-> Full technical narrative: [spark_iteration_summary.md](spark_iteration_summary.md)  
-> Interview prep (concepts + Q&A): [spark_interview_prep.md](spark_interview_prep.md)
-
 ### Why Spark?
 
 The feature computation per pool is fixed and modest (~100k positions, 2M swaps). The scale is in the **number of pools**: dozens of Celo pools, hundreds across chains. Spark's value is scheduling, not computation — one task per pool, N pools in parallel across Dataproc workers.
