@@ -12,6 +12,9 @@ psycopg2-binary
 hypersync
 pyyaml
 
+# PySpark (feature/pyspark-pipeline branch)
+pyspark
+
 # Survival analysis (statistical layer)
 lifelines
 matplotlib
