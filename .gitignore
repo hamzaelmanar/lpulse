@@ -17,3 +17,6 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Local architecture notes (not for repo)
+v1-lpulse-architecture.md
